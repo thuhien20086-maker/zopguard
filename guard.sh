@@ -73,7 +73,7 @@ check_license() {
 
 self_destruct() {
   # 只删自己的守护与配置，绝不碰客户的 ZopToken 客户端
-  launchctl unload "$HOME/Library/LaunchAgents/com.zopguard.guard.plist" 2>/dev/null
+  launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null
   sleep 1
   rm -rf "$DIR"
   rm -f "$HOME/Library/LaunchAgents/com.zopguard.guard.plist"
