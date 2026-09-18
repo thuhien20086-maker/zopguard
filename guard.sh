@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.6（通用版）
-# zopguard-version: 1.6
+# zopguard —— ZopToken 自愈守护 v1.7（通用版）
+# zopguard-version: 1.7
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -41,6 +41,44 @@ COOLDOWN_SEC=720      # 两次自动修复最小间隔（秒）
 DAILY_MAX=${ZOPGUARD_DAILY_MAX:-20}  # 每日自动修复上限（防重启风暴；v1.5 由 12 调至 20，可用环境变量覆盖）
 
 AUTO_UPDATE_URL="${AUTO_UPDATE_URL:-}"  # 自更新源（config.sh 可配）：v1.6 起支持，格式 https://cdn.jsdelivr.net/gh/用户/仓库@分支/guard.sh
+LIC="$DIR/license"                      # v1.7 授权文件：客户名|到期时间戳|HMAC签名；不存在=自用版（无限期）
+
+# ---------- v1.7：授权校验（license）+ 到期自毁 ----------
+# license 行格式：客户名|到期时间戳|HMAC(客户名|到期时间戳，密钥)  密钥在 config.sh 的 ZOPGUARD_LICENSE_KEY
+check_license() {
+  [ -f "$LIC" ] || { echo "SELF"; return 0; }
+  local cust exp sig calc now lk
+  IFS='|' read -r cust exp sig < "$LIC" 2>/dev/null || { log "license: 文件损坏"; return 2; }
+  lk="${ZOPGUARD_LICENSE_KEY:-}"
+  [ -z "$lk" ] && { log "license: 缺 ZOPGUARD_LICENSE_KEY"; return 2; }
+  calc=$(printf '%s|%s' "$cust" "$exp" | openssl dgst -sha256 -hmac "$lk" 2>/dev/null | awk '{print $NF}')
+  [ "$calc" = "$sig" ] || { log "license: 签名无效（被篡改？）"; return 2; }
+  now=$(date +%s)
+  if [ $((exp - now)) -le 86400 ] && [ $((exp - now)) -gt 0 ]; then
+    noted=$(sget LIC_NOTED)
+    if [ "$noted" != "$exp" ]; then
+      notify "⏳ [$MACHINE_NAME] 服务将于 $(date -r "$exp" '+%F') 到期，如需继续使用请及时续费。"
+      sput LIC_NOTED "$exp"
+    fi
+  fi
+  if [ "$now" -ge "$exp" ]; then
+    log "license: 已到期（客户：$cust，$(date -r "$exp" '+%F')），执行自毁"
+    notify "🚫 [$MACHINE_NAME] 服务已到期，守护已自动退出并卸载。如需继续使用请联系续费，续费后重新安装一条命令即可恢复。"
+    self_destruct
+    return 3
+  fi
+  echo "LIC($cust/$(date -r "$exp" '+%F'))"
+  return 0
+}
+
+self_destruct() {
+  # 只删自己的守护与配置，绝不碰客户的 ZopToken 客户端
+  launchctl unload "$HOME/Library/LaunchAgents/com.zopguard.guard.plist" 2>/dev/null
+  sleep 1
+  rm -rf "$DIR"
+  rm -f "$HOME/Library/LaunchAgents/com.zopguard.guard.plist"
+  exit 0
+}
 
 # ---------- v1.6：自更新（每轮顺带查一次 VERSION，有新版本自动下载→校验→替换→重启） ----------
 auto_update() {
@@ -107,12 +145,17 @@ notify() { # $1 = 消息文本（单行）
   [ "${ZOPGUARD_DRY:-0}" = "1" ] && { log "notify(dry): $text"; echo "[dry] $text"; return 0; }
   if [ "$NOTIFY_TYPE" = "feishu_webhook" ]; then
     [ -z "${FEISHU_WEBHOOK_URL:-}" ] && { log "notify: 未配置 FEISHU_WEBHOOK_URL"; return 1; }
-    resp=$(curl -s -m 10 -X POST "$FEISHU_WEBHOOK_URL" -H "Content-Type: application/json" \
-      --data "{\"msg_type\":\"text\",\"content\":{\"text\":\"$(esc1 "$text")\"}}")
-    case "$resp" in
-      *'"code":0'*|*'"StatusCode":0'*) log "notify sent: $text"; return 0 ;;
-      *) log "notify fail: $resp"; return 1 ;;
-    esac
+    # v1.7 双通道：主群（客户群）必发；FEISHU_WEBHOOK_URL2（服务商监控群）有则同发
+    for _wurl in "${FEISHU_WEBHOOK_URL:-}" "${FEISHU_WEBHOOK_URL2:-}"; do
+      [ -z "$_wurl" ] && continue
+      resp=$(curl -s -m 10 -X POST "$_wurl" -H "Content-Type: application/json" \
+        --data "{\"msg_type\":\"text\",\"content\":{\"text\":\"$(esc1 "$text")\"}}")
+      case "$resp" in
+        *'\"code\":0'*|*'\"StatusCode\":0'*) log "notify sent: $text" ;;
+        *) log "notify fail: $resp" ;;
+      esac
+    done
+    return 0
   fi
   # feishu_app 模式
   [ -z "${FEISHU_APP_ID:-}" ] && { log "notify: 未配置飞书应用凭证"; return 1; }
@@ -196,6 +239,8 @@ api_relogin() {
 # ---------- 核心：检查 & 修复 ----------
 check_and_repair() {
   local now last cnt today cd_date noted reason="" pmsg pv
+  # v1.7 授权校验（客户机：到期自动自毁退出；自用机无 license 正常放行）
+  check_license >/dev/null 2>&1 || return 1
   now=$(date +%s)
   today=$(date +%F)
   last=$(sget LAST_REPAIR); last=${last:-0}
@@ -286,7 +331,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.6 =="
+  echo "== zopguard 自检 v1.7 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -298,9 +343,10 @@ selftest() {
   echo "登录密钥: $([ -n "${ZOPT_LOGIN_KEY:-}" ] && echo "已配置（${ZOPT_LOGIN_KEY:0:8}…）✓ 登出/槽位到期自动 API 直登恢复" || echo "未配置（登出后无法自动重登，请补 ZOPT_LOGIN_KEY）")"
   echo "平台自查: $(plat_check) (exit=$?)"
   echo "自更新: $([ -n "$AUTO_UPDATE_URL" ] && echo "已配置 ✓（$AUTO_UPDATE_URL）" || echo "未配置（升级需手动）")"
+  echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.6 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.7 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
