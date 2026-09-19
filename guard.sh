@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.9（通用版）
-# zopguard-version: 1.9
+# zopguard —— ZopToken 自愈守护 v1.10（通用版）
+# zopguard-version: 1.10
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -57,21 +57,25 @@ check_remote_cmd() {
   }
   [ -z "$body" ] && return 0
   ts=$(echo "$body" | cut -d'|' -f1 | tr -d '[:space:]')
-  target=$(echo "$body" | cut -d'|' -f2- | tr -d '[:space:]')
+  target=$(echo "$body" | cut -d'|' -f2- | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')  # v1.10：只去首尾，保留机器名内部空格
   case "$ts" in *[!0-9]*|"") return 0 ;; esac
   local last
   last=$(sget CMD_TS); last=${last:-0}
   [ "$ts" -le "$last" ] 2>/dev/null && return 0
-  if [ "$target" = "all" ] || echo ",$target," | grep -q ",$MACHINE_NAME,"; then
+  if [ "$target" = "all" ] || echo ",$target," | grep -Fq ",$MACHINE_NAME,"; then
     sput CMD_TS "$ts"
     log "remote-cmd: 收到重启指令（${ts}），60 秒后重启"
     notify "🔁 [$MACHINE_NAME] 收到看板远程重启指令，60 秒后自动重启。"
     # 优先 sudo shutdown（launchd 会话下可靠）；AUTOLOGIN_PASS 没进 config 时退回 osascript（GUI 会话）
     ( sleep 60
       if [ -n "${AUTOLOGIN_PASS:-}" ]; then
-        printf '%s\n' "$AUTOLOGIN_PASS" | sudo -S shutdown -r now 2>/dev/null
+        if ! printf '%s\n' "$AUTOLOGIN_PASS" | sudo -S shutdown -r now 2>/dev/null; then
+          log "remote-cmd: sudo 重启失败，退回 osascript"
+          notify "⚠️ [$MACHINE_NAME] 远程重启 sudo 失败（密码失效？），已尝试 GUI 方式重启。"
+          osascript -e 'tell app "System Events" to restart' 2>/dev/null
+        fi
       else
-        osascript -e 'tell app "System Events" to restart' 2>/dev/null
+        osascript -e 'tell app "System Events" to restart' 2>/dev/null || notify "⚠️ [$MACHINE_NAME] 远程重启失败（无密码且 GUI 未授权），请人工重启。"
       fi ) &
   fi
 }
@@ -81,11 +85,31 @@ check_remote_cmd() {
 check_license() {
   [ -f "$LIC" ] || { echo "SELF"; return 0; }
   local cust exp sig calc now lk
-  IFS='|' read -r cust exp sig < "$LIC" 2>/dev/null || { log "license: 文件损坏"; return 2; }
+  IFS='|' read -r cust exp sig < "$LIC" 2>/dev/null || cust=""
+  # v1.10：字段数不齐/为空 → 文件损坏，降级按自用版继续守护并告警（防静默停摆）
+  if [ -z "$cust" ] || [ -z "$exp" ] || [ -z "$sig" ]; then
+    noted=$(sget LIC_BROKEN_NOTED)
+    if [ "$noted" != "1" ]; then
+      notify "⚠️ [$MACHINE_NAME] 授权文件损坏，已临时按自用版继续守护，请人工检查（不影响 ZopToken 保护）。"
+      sput LIC_BROKEN_NOTED 1
+    fi
+    log "license: 文件损坏，降级自用版守护"
+    echo "BROKEN"
+    return 0
+  fi
   lk="${ZOPGUARD_LICENSE_KEY:-}"
-  [ -z "$lk" ] && { log "license: 缺 ZOPGUARD_LICENSE_KEY"; return 2; }
+  [ -z "$lk" ] && { log "license: 缺 ZOPGUARD_LICENSE_KEY，降级自用版守护"; echo "BROKEN-NOKEY"; return 0; }
   calc=$(printf '%s|%s' "$cust" "$exp" | openssl dgst -sha256 -hmac "$lk" 2>/dev/null | awk '{print $NF}')
-  [ "$calc" = "$sig" ] || { log "license: 签名无效（被篡改？）"; return 2; }
+  if [ "$calc" != "$sig" ]; then
+    noted=$(sget LIC_BROKEN_NOTED)
+    if [ "$noted" != "1" ]; then
+      notify "⚠️ [$MACHINE_NAME] 授权签名无效（可能被篡改或密钥不匹配），已临时按自用版继续守护，请人工检查。"
+      sput LIC_BROKEN_NOTED 1
+    fi
+    log "license: 签名无效，降级自用版守护"
+    echo "BROKEN-SIG"
+    return 0
+  fi
   now=$(date +%s)
   if [ $((exp - now)) -le 86400 ] && [ $((exp - now)) -gt 0 ]; then
     noted=$(sget LIC_NOTED)
@@ -106,10 +130,10 @@ check_license() {
 
 self_destruct() {
   # 只删自己的守护与配置，绝不碰客户的 ZopToken 客户端
-  launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null
-  sleep 1
+  # v1.10：先删文件再 bootout——bootout 会 SIGTERM 本进程，若先 bootout 则删文件永远执行不到
   rm -rf "$DIR"
   rm -f "$HOME/Library/LaunchAgents/com.zopguard.guard.plist"
+  ( sleep 1; launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null ) &
   exit 0
 }
 
@@ -128,6 +152,10 @@ auto_update() {
   [ -z "$remote_ver" ] && return 0
   local_ver=$(grep '^# zopguard-version:' "$0" 2>/dev/null | awk '{print $2}')
   [ "$remote_ver" = "$local_ver" ] && return 0
+  # v1.10：只升不降 + 「已尝试版本」闸——remote 必须数值大于 local；与上次尝试相同则本轮跳过
+  [ "$(printf '%s\n%s\n' "$remote_ver" "$local_ver" | sort -V | tail -1)" = "$remote_ver" ] || { log "auto-update: 远端版本 $remote_ver 不高于本地 $local_ver，忽略"; return 0; }
+  last_tried=$(sget UPD_LAST_VER)
+  [ "$last_tried" = "$remote_ver" ] && return 0
   # 有新版本：下载 → 多重校验 → 替换
   tmp="/tmp/zopguard-new.$$"
   curl -m 30 -s "$AUTO_UPDATE_URL" -o "$tmp" 2>/dev/null \
@@ -136,9 +164,10 @@ auto_update() {
   head -1 "$tmp" | grep -q '^#!/bin/bash' || { rm -f "$tmp"; return 0; }
   bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
   grep -q "zopguard-version: $remote_ver" "$tmp" || { rm -f "$tmp"; return 0; }
-  cp "$tmp" "$0" && chmod +x "$0" && rm -f "$tmp"
-  log "auto-update: v$local_ver → v$remote_ver，重启守护"
-  launchctl kickstart -k "gui/$(id -u)/com.zopguard.guard" 2>/dev/null
+  cp "$tmp" "$0.new" && mv "$0.new" "$0" && chmod +x "$0" && rm -f "$tmp"
+  sput UPD_LAST_VER "$remote_ver"
+  log "auto-update: v$local_ver → v$remote_ver（下轮起生效，本轮 exit 释放锁）"
+  # v1.10：不再 kickstart 自杀（SIGKILL 会让锁残留 30 分钟死窗）；下个 StartInterval 自然用新版本
   exit 0
 }
 
@@ -149,12 +178,18 @@ if [ ! -d "$APP_PATH" ]; then
   done
 fi
 
-log() { echo "[$(date '+%F %T')] $*" >> "$LOG" 2>/dev/null; }
+log() { # v1.10：超 5MB 轮转，防日志无限增长
+  if [ -f "$LOG" ]; then
+    local sz; sz=$(wc -c < "$LOG" 2>/dev/null | tr -d ' '); sz=${sz:-0}
+    if [ "${sz:-0}" -gt 5242880 ] 2>/dev/null; then mv "$LOG" "$LOG.1" 2>/dev/null; fi
+  fi
+  echo "[$(date '+%F %T')] $*" >> "$LOG" 2>/dev/null || echo "[$(date '+%F %T')] $*" >&2
+}
 
 # ---------- 状态键值读写 ----------
 sget() { [ -f "$STATE" ] && sed -n "s/^$1=//p" "$STATE" | head -1; }
 sput() { # key value
-  local k="$1" v="$2" tmp="$STATE.tmp"
+  local k="$1" v="$2" tmp="$STATE.tmp.$$"   # v1.10：tmp 带 PID，防并发实例互相截断
   if [ -f "$STATE" ]; then grep -v "^$k=" "$STATE" > "$tmp" 2>/dev/null; else : > "$tmp"; fi
   echo "$k=$v" >> "$tmp"
   mv "$tmp" "$STATE"
@@ -192,6 +227,8 @@ notify() { # $1 = 消息文本（单行）
   fi
   # feishu_app 模式
   [ -z "${FEISHU_APP_ID:-}" ] && { log "notify: 未配置飞书应用凭证"; return 1; }
+  [ -z "${FEISHU_APP_SECRET:-}" ] && { log "notify: 缺 FEISHU_APP_SECRET（set -u 防护）"; return 1; }
+  [ -z "${FEISHU_CHAT_ID:-}" ] && { log "notify: 缺 FEISHU_CHAT_ID（set -u 防护）"; return 1; }
   tt=$(curl -s -m 10 -X POST "https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal" \
        -H "Content-Type: application/json" \
        --data "{\"app_id\":\"$FEISHU_APP_ID\",\"app_secret\":\"$FEISHU_APP_SECRET\"}" \
@@ -211,23 +248,33 @@ notify() { # $1 = 消息文本（单行）
 # stdout 一行描述；exit 0=平台正常 1=平台侧异常（按掉线处理） 2=不可判（不动手）
 plat_check() {
   [ -z "${ZOPT_TOKEN:-}" ] && { echo "skip: no-token"; return 2; }
-  local sn body st se found
-  sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*"IOPlatformSerialNumber" = "\([^"]*\)".*/\1/p' | head -1)}"
+  local sn body st se found page total
+  sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*IOPlatformSerialNumber.*=.*"\([^"]*\)".*/\1/p' | head -1)}"
   [ -z "$sn" ] && sn="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2}' | head -1)"
   [ -z "$sn" ] && { echo "skip: no-sn"; return 2; }
-  body=$(curl -m 90 -s "https://www.zoptoken.com/api/console/device_group/devices?group_id=${PLATFORM_API_GID}&page=1&page_size=50" -H "token: $ZOPT_TOKEN" -H "User-Agent: zopguard/1.5" 2>/dev/null)
-  [ -z "$body" ] && { echo "skip: net-unreachable"; return 2; }
-  printf '%s' "$body" | jq -e '.code == 1' >/dev/null 2>&1 || { echo "skip: api-code"; return 2; }
+  # v1.10：翻页直到找到本机 SN（>50 台设备的组不再误判 not-listed）
+  page=1; found="0"
+  while [ "$page" -le 10 ]; do
+    body=$(curl -m 90 -s "https://www.zoptoken.com/api/console/device_group/devices?group_id=${PLATFORM_API_GID}&page=$page&page_size=50" -H "token: $ZOPT_TOKEN" -H "User-Agent: zopguard/1.10" 2>/dev/null)
+    [ -z "$body" ] && { echo "skip: net-unreachable"; return 2; }
+    printf '%s' "$body" | jq -e '.code == 1' >/dev/null 2>&1 || { echo "skip: api-code"; return 2; }
+    found=$(printf '%s' "$body" | jq -r --arg sn "$sn" '[.data.list[] | select(.sn==$sn)] | length' 2>/dev/null | head -1)
+    case "$found" in
+      ''|*[!0-9]*) echo "skip: jq-parse"; return 2 ;;
+      '1') break ;;
+    esac
+    total=$(printf '%s' "$body" | jq -r '.data.total // 0' 2>/dev/null | head -1)
+    [ "${total:-0}" -gt $((page * 50)) ] 2>/dev/null || break
+    page=$((page + 1))
+  done
+  if [ "$found" != "1" ]; then echo "unhealthy: not-listed(sn=$sn)"; return 1; fi
   # v1.5：先判「设备是否在列表」；「在列但字段缺失」与「不在列表」分开处理——
   # 字段缺失（平台改版类）一律 skip 不修复，杜绝假修复（2026-09-18 教训）
-  found=$(printf '%s' "$body" | jq -r --arg sn "$sn" '[.data.list[] | select(.sn==$sn)] | length' 2>/dev/null | head -1)
-  case "$found" in
-    ''|*[!0-9]*) echo "skip: jq-parse"; return 2 ;;
-    '0') echo "unhealthy: not-listed(sn=$sn)"; return 1 ;;
-  esac
   st=$(printf '%s' "$body" | jq -r --arg sn "$sn" '.data.list[] | select(.sn==$sn) | .state // empty' 2>/dev/null | head -1)
   if [ -z "$st" ]; then echo "skip: state-missing"; return 2; fi
   se=$(printf '%s' "$body" | jq -r --arg sn "$sn" '.data.list[] | select(.sn==$sn) | .slot_expire_time // empty' 2>/dev/null | head -1)
+  # v1.10：slot_expire_time 字段缺失 → skip（与 state-missing 同策略，不判 healthy 也不判坏）
+  if [ -z "$se" ]; then echo "skip: se-missing"; return 2; fi
   if [ "$st" != "healthy" ] || [ "$se" = "0" ]; then
     echo "unhealthy: state=$st slot_expire=$se"; return 1
   fi
@@ -271,15 +318,28 @@ api_relogin() {
 
 # ---------- 核心：检查 & 修复 ----------
 check_and_repair() {
-  local now last cnt today cd_date noted reason="" pmsg pv
+  local now last cnt today cd_date noted reason="" pmsg pv maxt
   # v1.7 授权校验（客户机：到期自动自毁退出；自用机无 license 正常放行）
   check_license >/dev/null 2>&1 || return 1
   now=$(date +%s)
   today=$(date +%F)
+  # v1.10 时钟回拨防护：now 小于历史最大值时按历史最大值算（防冷却失效/授权复活）
+  maxt=$(sget LAST_SEEN_TIME); maxt=${maxt:-0}
+  if [ "$now" -lt "$maxt" ] 2>/dev/null; then log "clock-rollback: $now < $maxt，按单调时间处理"; now=$maxt; fi
+  sput LAST_SEEN_TIME "$(date +%s)"
   last=$(sget LAST_REPAIR); last=${last:-0}
   cnt=$(sget COUNT); cnt=${cnt:-0}
   cd_date=$(sget COUNT_DATE)
-  if [ "$cd_date" != "$today" ]; then cnt=0; sput COUNT_DATE "$today"; sput COUNT 0; fi
+  # v1.10：每日重置合并为单次原子写（防中途被杀导致计数不清零）
+  if [ "$cd_date" != "$today" ]; then
+    cnt=0
+    {
+      grep -v -E '^(COUNT_DATE|COUNT)=' "$STATE" > "$STATE.tmp.$$" 2>/dev/null || : > "$STATE.tmp.$$"
+      echo "COUNT_DATE=$today" >> "$STATE.tmp.$$"
+      echo "COUNT=0" >> "$STATE.tmp.$$"
+      mv "$STATE.tmp.$$" "$STATE"
+    }
+  fi
 
   # ① 进程检查 + 平台自查
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -376,7 +436,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.9 =="
+  echo "== zopguard 自检 v1.10 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -391,7 +451,7 @@ selftest() {
   echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.8 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.10 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
@@ -404,8 +464,8 @@ fi
 mkdir -p "$DIR" 2>/dev/null
 LOCK="$DIR/.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
-  # 已存在：并发运行则直接退出；陈旧锁（>10 分钟残留）清理后重试一次
-  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +10 2>/dev/null)" ]; then
+  # 已存在：并发运行则直接退出；陈旧锁（>30 分钟残留；修复最坏路径约 22 分钟）清理后重试一次
+  if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
     rmdir "$LOCK" 2>/dev/null
     mkdir "$LOCK" 2>/dev/null || exit 0
   else
