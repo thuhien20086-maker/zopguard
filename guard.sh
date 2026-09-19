@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.12（通用版）
-# zopguard-version: 1.12
+# zopguard —— ZopToken 自愈守护 v1.13（通用版）
+# zopguard-version: 1.13
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -67,7 +67,8 @@ check_remote_cmd() {
     log "remote-cmd: 收到重启指令（${ts}），60 秒后重启"
     notify "🔁 [$MACHINE_NAME] 收到看板远程重启指令，60 秒后自动重启。"
     # 优先 sudo shutdown（launchd 会话下可靠）；AUTOLOGIN_PASS 没进 config 时退回 osascript（GUI 会话）
-    ( sleep 60
+    ( trap - EXIT   # v1.13：清除继承的锁释放 trap，防误删活锁
+      sleep 60
       if [ -n "${AUTOLOGIN_PASS:-}" ]; then
         if ! printf '%s\n' "$AUTOLOGIN_PASS" | sudo -S shutdown -r now 2>/dev/null; then
           log "remote-cmd: sudo 重启失败，退回 osascript"
@@ -136,8 +137,8 @@ self_destruct() {
   # v1.10：先删文件再 bootout——bootout 会 SIGTERM 本进程，若先 bootout 则删文件永远执行不到
   rm -rf "$DIR"
   rm -f "$HOME/Library/LaunchAgents/com.zopguard.guard.plist"
-  ( sleep 1; launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null ) &
-  exit 0
+  ( trap - EXIT; sleep 1; launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null ) &
+  exit 3   # v1.13：到期自毁以非零码退出（return 3 契约可达）
 }
 
 # ---------- v1.6：自更新（每轮顺带查一次 VERSION，有新版本自动下载→校验→替换→重启） ----------
@@ -155,8 +156,20 @@ auto_update() {
   [ -z "$remote_ver" ] && return 0
   local_ver=$(grep '^# zopguard-version:' "$0" 2>/dev/null | awk '{print $2}')
   [ "$remote_ver" = "$local_ver" ] && return 0
-  # v1.10：只升不降 + 「已尝试版本」闸——remote 必须数值大于 local；与上次尝试相同则本轮跳过
-  [ "$(printf '%s\n%s\n' "$remote_ver" "$local_ver" | sort -V | tail -1)" = "$remote_ver" ] || { log "auto-update: 远端版本 $remote_ver 不高于本地 $local_ver，忽略"; return 0; }
+  # v1.13：只升不降 + 「已尝试版本」闸——用 awk 数值比较（POSIX 安全，老 macOS 无 sort -V）
+  ver_cmp() { # 1=$1>$2 0=其他；按点分数字段逐段比较
+    printf '%s\n%s\n' "$1" "$2" | awk -F. '
+      NR==1{split($0,a,FS)}
+      NR==2{split($0,b,FS); n=NF; if(length(a)>n)n=length(a);
+        for(i=1;i<=n;i++){av=a[i]+0; bv=b[i]+0;
+          if(av>bv){print 1;exit}
+          if(av<bv){print 0;exit}}
+        print 0; exit}'
+  }
+  if [ "$(ver_cmp "$remote_ver" "$local_ver")" != "1" ]; then
+    log "auto-update: 远端版本 $remote_ver 不高于本地 $local_ver，忽略"
+    return 0
+  fi
   last_tried=$(sget UPD_LAST_VER)
   [ "$last_tried" = "$remote_ver" ] && return 0
   # 有新版本：下载 → 多重校验 → 替换
@@ -255,17 +268,30 @@ plat_check() {
   sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*IOPlatformSerialNumber.*=.*"\([^"]*\)".*/\1/p' | head -1)}"
   [ -z "$sn" ] && sn="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2}' | head -1)"
   [ -z "$sn" ] && { echo "skip: no-sn"; return 2; }
-  # v1.11：jq 缺失粗判模式——macOS 出厂不带 jq（客户机未必装），没有 jq 时用「设备在列=健康」兜底
+  # v1.11：jq 缺失粗判模式——macOS 出厂不带 jq（客户机未必装），没有 jq 时用 grep 兜底
   if ! command -v jq >/dev/null 2>&1; then
-    body=$(curl -m 90 -s "https://www.zoptoken.com/api/console/device_group/devices?group_id=${PLATFORM_API_GID}&page=1&page_size=50" -H "token: $ZOPT_TOKEN" -H "User-Agent: zopguard/1.11" 2>/dev/null)
-    [ -z "$body" ] && { echo "skip: net-unreachable"; return 2; }
-    code=$(printf '%s' "$body" | sed -n 's/.*"code":\([0-9]*\).*/\1/p' | head -1)
-    [ "$code" != "1" ] && { echo "skip: api-code"; return 2; }
-    if printf '%s' "$body" | grep -Fq "\"sn\":\"$sn\""; then
-      echo "ok: listed(coarse)"; return 0
-    else
-      echo "unhealthy: not-listed(coarse)"; return 1
-    fi
+    local cpage cnlist
+    cpage=1
+    while [ "$cpage" -le 10 ]; do
+      body=$(curl -m 90 -s "https://www.zoptoken.com/api/console/device_group/devices?group_id=${PLATFORM_API_GID}&page=$cpage&page_size=50" -H "token: $ZOPT_TOKEN" -H "User-Agent: zopguard/1.13" 2>/dev/null)
+      [ -z "$body" ] && { echo "skip: net-unreachable"; return 2; }
+      code=$(printf '%s' "$body" | awk 'match($0,/"code":[0-9]+/){print substr($0,RSTART+7,RLENGTH-7); exit}')
+      [ "$code" != "1" ] && { echo "skip: api-code"; return 2; }
+      if printf '%s' "$body" | grep -Fq "\"sn\":\"$sn\""; then
+        # v1.13：在列后再验 state/slot 字段（与精判同判据），防「在列但槽位被释放」漏检
+        if printf '%s' "$body" | grep -Fq '"slot_expire_time":"0"' ; then
+          echo "unhealthy: slot-expired(coarse)"; return 1
+        fi
+        if ! printf '%s' "$body" | grep -Fq '"state":"healthy"'; then
+          echo "unhealthy: state-bad(coarse)"; return 1
+        fi
+        echo "ok: listed(coarse)"; return 0
+      fi
+      cnlist=$(printf '%s' "$body" | grep -o '"sn":' | wc -l | tr -d ' ')
+      [ "${cnlist:-0}" -ge 50 ] 2>/dev/null || break
+      cpage=$((cpage + 1))
+    done
+    echo "unhealthy: not-listed(coarse)"; return 1
   fi
   # v1.10：翻页直到找到本机 SN（>50 台设备的组不再误判 not-listed）
   page=1; found="0"
@@ -344,7 +370,7 @@ check_and_repair() {
   # v1.10 时钟回拨防护：now 小于历史最大值时按历史最大值算（防冷却失效/授权复活）
   maxt=$(sget LAST_SEEN_TIME); maxt=${maxt:-0}
   if [ "$now" -lt "$maxt" ] 2>/dev/null; then log "clock-rollback: $now < $maxt，按单调时间处理"; now=$maxt; fi
-  sput LAST_SEEN_TIME "$(date +%s)"
+  sput LAST_SEEN_TIME "$now"   # v1.13：回写修正后的值（用真实时钟会击穿单调地板）
   last=$(sget LAST_REPAIR); last=${last:-0}
   cnt=$(sget COUNT); cnt=${cnt:-0}
   cd_date=$(sget COUNT_DATE)
@@ -463,7 +489,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.12 =="
+  echo "== zopguard 自检 v1.13 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -478,7 +504,7 @@ selftest() {
   echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.10 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.13 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
