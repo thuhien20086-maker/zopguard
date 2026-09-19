@@ -38,10 +38,32 @@ MACHINE_NAME="${MACHINE_NAME:-$(hostname)}"
 NOTIFY_TYPE="${NOTIFY_TYPE:-feishu_app}"
 PLATFORM_API_GID="${ZOPT_GID:-69}"
 COOLDOWN_SEC=720      # 两次自动修复最小间隔（秒）
-DAILY_MAX=${ZOPGUARD_DAILY_MAX:-20}  # 每日自动修复上限（防重启风暴；v1.5 由 12 调至 20，可用环境变量覆盖）
+DAILY_MAX=${ZOPGUARD_DAILY_MAX:-50}  # 每日自动修复上限（防重启风暴；v1.7 由 20 调至 50，可用环境变量覆盖）
 
 AUTO_UPDATE_URL="${AUTO_UPDATE_URL:-}"  # 自更新源（config.sh 可配）：v1.6 起支持，格式 https://cdn.jsdelivr.net/gh/用户/仓库@分支/guard.sh
+REMOTE_CMD_URL="${REMOTE_CMD_URL:-}"    # v1.8 中心命令文件（看板「一键重启」用）；仅自用机响应（有 license 的客户机不响应）
 LIC="$DIR/license"                      # v1.7 授权文件：客户名|到期时间戳|HMAC签名；不存在=自用版（无限期）
+
+# ---------- v1.8：中心远程重启命令（看板一键重启 → GitHub cmd/reboot.txt → 机端 3 分钟内执行） ----------
+check_remote_cmd() {
+  [ -z "$REMOTE_CMD_URL" ] && return 0
+  [ -f "$LIC" ] && return 0          # 客户机不响应中心命令
+  local body ts target
+  body=$(curl -m 15 -s "$REMOTE_CMD_URL" 2>/dev/null)
+  [ -z "$body" ] && return 0
+  ts=$(echo "$body" | cut -d'|' -f1 | tr -d '[:space:]')
+  target=$(echo "$body" | cut -d'|' -f2- | tr -d '[:space:]')
+  case "$ts" in *[!0-9]*|"") return 0 ;; esac
+  local last
+  last=$(sget CMD_TS); last=${last:-0}
+  [ "$ts" -le "$last" ] 2>/dev/null && return 0
+  if [ "$target" = "all" ] || echo ",$target," | grep -q ",$MACHINE_NAME,"; then
+    sput CMD_TS "$ts"
+    log "remote-cmd: 收到重启指令（$ts），60 秒后重启"
+    notify "🔁 [$MACHINE_NAME] 收到看板远程重启指令，60 秒后自动重启。"
+    ( sleep 60; osascript -e 'tell app "System Events" to restart' ) &
+  fi
+}
 
 # ---------- v1.7：授权校验（license）+ 到期自毁 ----------
 # license 行格式：客户名|到期时间戳|HMAC(客户名|到期时间戳，密钥)  密钥在 config.sh 的 ZOPGUARD_LICENSE_KEY
@@ -258,6 +280,7 @@ check_and_repair() {
       log "ok: $APP 运行中（$pmsg）"
       echo "RUNNING"
       auto_update
+      check_remote_cmd
       return 0
     fi
   else
