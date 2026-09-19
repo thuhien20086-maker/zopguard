@@ -50,6 +50,9 @@ check_remote_cmd() {
   [ -f "$LIC" ] && return 0          # 客户机不响应中心命令
   local body ts target
   body=$(curl -m 15 -s "$REMOTE_CMD_URL" 2>/dev/null)
+  [ -z "$body" ] && {
+    body=$(curl -m 15 -s "https://raw.githubusercontent.com/thuhien20086-maker/zopguard/main/cmd/reboot.txt" 2>/dev/null)
+  }
   [ -z "$body" ] && return 0
   ts=$(echo "$body" | cut -d'|' -f1 | tr -d '[:space:]')
   target=$(echo "$body" | cut -d'|' -f2- | tr -d '[:space:]')
@@ -59,7 +62,7 @@ check_remote_cmd() {
   [ "$ts" -le "$last" ] 2>/dev/null && return 0
   if [ "$target" = "all" ] || echo ",$target," | grep -q ",$MACHINE_NAME,"; then
     sput CMD_TS "$ts"
-    log "remote-cmd: 收到重启指令（$ts），60 秒后重启"
+    log "remote-cmd: 收到重启指令（${ts}），60 秒后重启"
     notify "🔁 [$MACHINE_NAME] 收到看板远程重启指令，60 秒后自动重启。"
     ( sleep 60; osascript -e 'tell app "System Events" to restart' ) &
   fi
