@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.11（通用版）
-# zopguard-version: 1.11
+# zopguard —— ZopToken 自愈守护 v1.12（通用版）
+# zopguard-version: 1.12
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -251,10 +251,22 @@ notify() { # $1 = 消息文本（单行）
 # stdout 一行描述；exit 0=平台正常 1=平台侧异常（按掉线处理） 2=不可判（不动手）
 plat_check() {
   [ -z "${ZOPT_TOKEN:-}" ] && { echo "skip: no-token"; return 2; }
-  local sn body st se found page total nlist
+  local sn body st se found page total nlist code
   sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*IOPlatformSerialNumber.*=.*"\([^"]*\)".*/\1/p' | head -1)}"
   [ -z "$sn" ] && sn="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2}' | head -1)"
   [ -z "$sn" ] && { echo "skip: no-sn"; return 2; }
+  # v1.11：jq 缺失粗判模式——macOS 出厂不带 jq（客户机未必装），没有 jq 时用「设备在列=健康」兜底
+  if ! command -v jq >/dev/null 2>&1; then
+    body=$(curl -m 90 -s "https://www.zoptoken.com/api/console/device_group/devices?group_id=${PLATFORM_API_GID}&page=1&page_size=50" -H "token: $ZOPT_TOKEN" -H "User-Agent: zopguard/1.11" 2>/dev/null)
+    [ -z "$body" ] && { echo "skip: net-unreachable"; return 2; }
+    code=$(printf '%s' "$body" | sed -n 's/.*"code":\([0-9]*\).*/\1/p' | head -1)
+    [ "$code" != "1" ] && { echo "skip: api-code"; return 2; }
+    if printf '%s' "$body" | grep -Fq "\"sn\":\"$sn\""; then
+      echo "ok: listed(coarse)"; return 0
+    else
+      echo "unhealthy: not-listed(coarse)"; return 1
+    fi
+  fi
   # v1.10：翻页直到找到本机 SN（>50 台设备的组不再误判 not-listed）
   page=1; found="0"
   while [ "$page" -le 10 ]; do
@@ -451,7 +463,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.11 =="
+  echo "== zopguard 自检 v1.12 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
