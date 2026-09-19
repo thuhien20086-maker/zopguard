@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.10（通用版）
-# zopguard-version: 1.10
+# zopguard —— ZopToken 自愈守护 v1.11（通用版）
+# zopguard-version: 1.11
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -111,6 +111,9 @@ check_license() {
     return 0
   fi
   now=$(date +%s)
+  # v1.11：时钟回拨防护（license 到期判定用单调时间，防回拨复活）
+  local lm; lm=$(sget LAST_SEEN_TIME); lm=${lm:-0}
+  [ "$now" -lt "$lm" ] 2>/dev/null && now=$lm
   if [ $((exp - now)) -le 86400 ] && [ $((exp - now)) -gt 0 ]; then
     noted=$(sget LIC_NOTED)
     if [ "$noted" != "$exp" ]; then
@@ -248,7 +251,7 @@ notify() { # $1 = 消息文本（单行）
 # stdout 一行描述；exit 0=平台正常 1=平台侧异常（按掉线处理） 2=不可判（不动手）
 plat_check() {
   [ -z "${ZOPT_TOKEN:-}" ] && { echo "skip: no-token"; return 2; }
-  local sn body st se found page total
+  local sn body st se found page total nlist
   sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*IOPlatformSerialNumber.*=.*"\([^"]*\)".*/\1/p' | head -1)}"
   [ -z "$sn" ] && sn="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2}' | head -1)"
   [ -z "$sn" ] && { echo "skip: no-sn"; return 2; }
@@ -264,8 +267,11 @@ plat_check() {
       '1') break ;;
     esac
     total=$(printf '%s' "$body" | jq -r '.data.total // 0' 2>/dev/null | head -1)
-    [ "${total:-0}" -gt $((page * 50)) ] 2>/dev/null || break
-    page=$((page + 1))
+    nlist=$(printf '%s' "$body" | jq -r '.data.list | length' 2>/dev/null | head -1)
+    # v1.11：total 字段缺失时按「本页满 50 条」继续翻页（平台未必返回 total）
+    [ "${total:-0}" -gt $((page * 50)) ] 2>/dev/null && { page=$((page + 1)); continue; }
+    [ "${nlist:-0}" -ge 50 ] 2>/dev/null && { page=$((page + 1)); continue; }
+    break
   done
   if [ "$found" != "1" ]; then echo "unhealthy: not-listed(sn=$sn)"; return 1; fi
   # v1.5：先判「设备是否在列表」；「在列但字段缺失」与「不在列表」分开处理——
@@ -289,7 +295,7 @@ plat_check() {
 api_relogin() {
   local utok resp code sn name cpu
   [ -z "${ZOPT_LOGIN_KEY:-}" ] && { log "api_relogin: 未配置 ZOPT_LOGIN_KEY"; return 1; }
-  sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*"IOPlatformSerialNumber" = "\([^"]*\)".*/\1/p' | head -1)}"
+  sn="${ZOPT_SN:-$(LC_ALL=C ioreg -l 2>/dev/null | sed -n 's/.*IOPlatformSerialNumber.*=.*"\([^"]*\)".*/\1/p' | head -1)}"
   [ -z "$sn" ] && sn="$(system_profiler SPHardwareDataType 2>/dev/null | awk -F': ' '/Serial Number/{print $2}' | head -1)"
   [ -z "$sn" ] && { log "api_relogin: 取不到 SN"; return 1; }
   name="${MACHINE_NAME:-$(hostname)}"
@@ -397,7 +403,16 @@ check_and_repair() {
     log "deep-restart: 今日首次掉线窗口，深度重启客户端（多等 8 秒让旧连接完全断开）"
     sleep 8
   fi
-  if ! open "$APP_PATH" 2>>"$LOG"; then open -b "com.zoptoken.-" 2>>"$LOG" || true; fi
+  if ! open "$APP_PATH" 2>>"$LOG"; then
+    if ! open -b "com.zoptoken.-" 2>>"$LOG"; then
+      # v1.11：两条路都失败 → 一次性告警（不再默默重试到上限）
+      local af; af=$(sget APP_FAIL_NOTED)
+      if [ "$af" != "1" ]; then
+        notify "⚠️ [$MACHINE_NAME] ZopToken 客户端无法启动（路径 $APP_PATH 无效？），请人工检查 App 位置。"
+        sput APP_FAIL_NOTED 1
+      fi
+    fi
+  fi
   # 轮询等待进程出现（最多 60 秒，每步 5 秒；ZOPGUARD_POLL_STEP 可调）
   local i ok=0
   for i in 1 2 3 4 5 6 7 8 9 10 11 12; do
@@ -436,7 +451,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.10 =="
+  echo "== zopguard 自检 v1.11 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
