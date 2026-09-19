@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.8（通用版）
-# zopguard-version: 1.8
+# zopguard —— ZopToken 自愈守护 v1.9（通用版）
+# zopguard-version: 1.9
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -9,6 +9,8 @@
 #   · v1.5（2026-09-18）：① 每日修复上限 12→20；② 平台判据加固——
 #     「设备不在列表」与「字段缺失」分开：字段缺失（平台改版类）一律 skip 不修复，
 #     杜绝「假修复」；③ ioreg 前加 LC_ALL=C 消 stderr 噪音
+#   · v1.9（2026-09-19）：每日一次「深度重启」——借当天首次掉线窗口，
+#     彻底断开旧 TCP 连接（多等 8 秒）再重开客户端；当天不掉线则不触发
 # 文件：~/zopguard/guard.sh ｜ 日志：~/zopguard/guard.log ｜ 配置：~/zopguard/config.sh
 #
 # 通知模式（config.sh 里 NOTIFY_TYPE）：
@@ -314,10 +316,21 @@ check_and_repair() {
   if [ -n "${ZOPT_LOGIN_KEY:-}" ]; then
     api_relogin; relogin_rc=$?
   fi
+  # v1.9：每日一次「深度重启」——借当天首次掉线窗口，彻底断开旧 TCP 连接再重开；
+  #       当天不掉线则不触发（此函数只在检测到异常时进入）
+  local deep=0
+  if [ "$(sget DEEP_RESTART_DAY)" != "$(date +%F)" ]; then
+    deep=1
+    sput DEEP_RESTART_DAY "$(date +%F)"
+  fi
   pkill -x "$APP" 2>/dev/null
   sleep 2
   pkill -9 -x "$APP" 2>/dev/null
   sleep 1
+  if [ "$deep" = "1" ]; then
+    log "deep-restart: 今日首次掉线窗口，深度重启客户端（多等 8 秒让旧连接完全断开）"
+    sleep 8
+  fi
   if ! open "$APP_PATH" 2>>"$LOG"; then open -b "com.zoptoken.-" 2>>"$LOG" || true; fi
   # 轮询等待进程出现（最多 60 秒，每步 5 秒；ZOPGUARD_POLL_STEP 可调）
   local i ok=0
@@ -357,7 +370,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.8 =="
+  echo "== zopguard 自检 v1.9 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
