@@ -66,7 +66,13 @@ check_remote_cmd() {
     sput CMD_TS "$ts"
     log "remote-cmd: 收到重启指令（${ts}），60 秒后重启"
     notify "🔁 [$MACHINE_NAME] 收到看板远程重启指令，60 秒后自动重启。"
-    ( sleep 60; osascript -e 'tell app "System Events" to restart' ) &
+    # 优先 sudo shutdown（launchd 会话下可靠）；AUTOLOGIN_PASS 没进 config 时退回 osascript（GUI 会话）
+    ( sleep 60
+      if [ -n "${AUTOLOGIN_PASS:-}" ]; then
+        printf '%s\n' "$AUTOLOGIN_PASS" | sudo -S shutdown -r now 2>/dev/null
+      else
+        osascript -e 'tell app "System Events" to restart' 2>/dev/null
+      fi ) &
   fi
 }
 
@@ -132,7 +138,7 @@ auto_update() {
   grep -q "zopguard-version: $remote_ver" "$tmp" || { rm -f "$tmp"; return 0; }
   cp "$tmp" "$0" && chmod +x "$0" && rm -f "$tmp"
   log "auto-update: v$local_ver → v$remote_ver，重启守护"
-  launchctl kickstart -k "gui/$(id -u)/com.long.zopguard" 2>/dev/null
+  launchctl kickstart -k "gui/$(id -u)/com.zopguard.guard" 2>/dev/null
   exit 0
 }
 
