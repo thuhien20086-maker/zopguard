@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.14（通用版）
-# zopguard-version: 1.14
+# zopguard —— ZopToken 自愈守护 v1.15（通用版）
+# zopguard-version: 1.15
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -318,9 +318,13 @@ plat_check() {
   st=$(printf '%s' "$body" | jq -r --arg sn "$sn" '.data.list[] | select(.sn==$sn) | .state // empty' 2>/dev/null | head -1)
   if [ -z "$st" ]; then echo "skip: state-missing"; return 2; fi
   se=$(printf '%s' "$body" | jq -r --arg sn "$sn" '.data.list[] | select(.sn==$sn) | .slot_expire_time // empty' 2>/dev/null | head -1)
-  # v1.10：slot_expire_time 字段缺失 → skip（与 state-missing 同策略，不判 healthy 也不判坏）
+  # v1.15：state 才是主判据——state 坏立即修（offline 设备平台不返回 slot_expire_time，
+  # 旧逻辑 se-missing 一律 skip 会把真掉线全漏掉）；se-missing 豁免仅在 state=healthy 时生效（防平台改版误修）
+  if [ "$st" != "healthy" ]; then
+    echo "unhealthy: state=$st slot_expire=$se"; return 1
+  fi
   if [ -z "$se" ]; then echo "skip: se-missing"; return 2; fi
-  if [ "$st" != "healthy" ] || [ "$se" = "0" ]; then
+  if [ "$se" = "0" ]; then
     echo "unhealthy: state=$st slot_expire=$se"; return 1
   fi
   echo "ok: $st"; return 0
@@ -490,7 +494,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.14 =="
+  echo "== zopguard 自检 v1.15 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -505,7 +509,7 @@ selftest() {
   echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.14 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.15 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
