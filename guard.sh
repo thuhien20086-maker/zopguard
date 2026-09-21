@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.16（通用版）
-# zopguard-version: 1.16
+# zopguard —— ZopToken 自愈守护 v1.17（通用版）
+# zopguard-version: 1.17
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -135,9 +135,17 @@ check_license() {
 self_destruct() {
   # 只删自己的守护与配置，绝不碰客户的 ZopToken 客户端
   # v1.10：先删文件再 bootout——bootout 会 SIGTERM 本进程，若先 bootout 则删文件永远执行不到
+  # v1.17：license 先备份到 DIR 外；bootout 失败（label/域不符）时恢复 license + 告警下轮重试，
+  #        否则到期客户机永久转自用版（无 license 降级放行）
+  cp -f "$DIR/license" "$TMPDIR/zopguard-lic-backup" 2>/dev/null
   rm -rf "$DIR"
   rm -f "$HOME/Library/LaunchAgents/com.zopguard.guard.plist"
-  ( trap - EXIT; sleep 1; launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null ) &
+  ( trap - EXIT; sleep 3; launchctl bootout "gui/$(id -u)/com.zopguard.guard" 2>/dev/null
+    sleep 1
+    if launchctl list 2>/dev/null | grep -q com.zopguard.guard; then
+      # bootout 失败：恢复 license，下轮重试（不静默转自用版）
+      mkdir -p "$DIR" && cp -f "$TMPDIR/zopguard-lic-backup" "$DIR/license" 2>/dev/null
+    fi ) &
   exit 3   # v1.13：到期自毁以非零码退出（return 3 契约可达）
 }
 
@@ -149,9 +157,14 @@ auto_update() {
   local remote_ver="" local_ver="" tmp=""
   # 双源尝试：主源拉不到就试 GitHub raw
   remote_ver=$(curl -m 15 -s "$ver_url" 2>/dev/null | tr -d '[:space:]')
+  # v1.17：剥离 v 前缀 + 校验格式（旧逻辑 v1.17 会被版本比较误判「不高于」→ 自更新永久失效）
+  remote_ver=$(printf '%s' "$remote_ver" | sed -E 's/^[vV]//; s/[^0-9.].*$//')
+  case "$remote_ver" in ''|*[!0-9.]*|*..*) remote_ver="";; esac
   [ -z "$remote_ver" ] && {
     ver_url="https://raw.githubusercontent.com/$(echo "$AUTO_UPDATE_URL" | sed -E 's|https://cdn.jsdelivr.net/gh/([^/]+/[^/@]+)@[^/]+/.*|\1|')/main/VERSION"
     remote_ver=$(curl -m 15 -s "$ver_url" 2>/dev/null | tr -d '[:space:]')
+    remote_ver=$(printf '%s' "$remote_ver" | sed -E 's/^[vV]//; s/[^0-9.].*$//')
+    case "$remote_ver" in ''|*[!0-9.]*|*..*) remote_ver="";; esac
   }
   [ -z "$remote_ver" ] && return 0
   local_ver=$(grep '^# zopguard-version:' "$0" 2>/dev/null | awk '{print $2}')
@@ -179,7 +192,7 @@ auto_update() {
   [ -s "$tmp" ] || { rm -f "$tmp"; return 0; }
   head -1 "$tmp" | grep -q '^#!/bin/bash' || { rm -f "$tmp"; return 0; }
   bash -n "$tmp" 2>/dev/null || { rm -f "$tmp"; return 0; }
-  grep -q "zopguard-version: $remote_ver" "$tmp" || { rm -f "$tmp"; return 0; }
+  grep -q "^# zopguard-version: ${remote_ver}$" "$tmp" || { rm -f "$tmp"; return 0; }
   cp "$tmp" "$0.new" && mv "$0.new" "$0" && chmod +x "$0" && rm -f "$tmp"
   if [ -f "$tmp" ] || [ -f "$0.new" ]; then
     # v1.16：替换失败（cp/mv/chmod 任一环节断）→ 清残留 + 记日志，下轮重试；
@@ -286,11 +299,15 @@ plat_check() {
       code=$(printf '%s' "$body" | awk 'match($0,/"code":[0-9]+/){print substr($0,RSTART+7,RLENGTH-7); exit}')
       [ "$code" != "1" ] && { echo "skip: api-code"; return 2; }
       if printf '%s' "$body" | grep -Fq "\"sn\":\"$sn\""; then
-        # v1.13：在列后再验 state/slot 字段（与精判同判据），防「在列但槽位被释放」漏检
-        if printf '%s' "$body" | grep -Fq '"slot_expire_time":"0"' ; then
+        # v1.17：设备级判定——用 awk 切出本机 SN 所在的对象片段，state/slot 只在本机片段内检查
+        # （旧逻辑对整页 50 台 grep：同页任一台健康→本机漏检，任一台停费→本机被误杀）
+        local devseg
+        devseg=$(printf '%s' "$body" | awk -v sn="$sn" 'BEGIN{RS="},"} index($0,"\"sn\":\"" sn "\"") {print $0 "}"}' | head -1)
+        [ -z "$devseg" ] && { echo "unhealthy: not-listed(coarse)"; return 1; }
+        if printf '%s' "$devseg" | grep -Fq '"slot_expire_time":"0"'; then
           echo "unhealthy: slot-expired(coarse)"; return 1
         fi
-        if ! printf '%s' "$body" | grep -Fq '"state":"healthy"'; then
+        if ! printf '%s' "$devseg" | grep -Fq '"state":"healthy"'; then
           echo "unhealthy: state-bad(coarse)"; return 1
         fi
         echo "ok: listed(coarse)"; return 0
@@ -377,6 +394,9 @@ check_and_repair() {
   local now last cnt today cd_date noted reason="" pmsg pv maxt
   # v1.7 授权校验（客户机：到期自动自毁退出；自用机无 license 正常放行）
   check_license >/dev/null 2>&1 || return 1
+  # v1.17：自更新与远程命令无条件执行（旧逻辑只在健康分支跑——坏机器永远收不到新版和一键重启）
+  auto_update
+  check_remote_cmd
   now=$(date +%s)
   today=$(date +%F)
   # v1.10 时钟回拨防护：now 小于历史最大值时按历史最大值算（防冷却失效/授权复活）
@@ -406,8 +426,6 @@ check_and_repair() {
     else
       log "ok: $APP 运行中（$pmsg）"
       echo "RUNNING"
-      auto_update
-      check_remote_cmd
       return 0
     fi
   else
@@ -476,6 +494,8 @@ check_and_repair() {
       sleep 5
       pmsg2=$(plat_check); pv=$?
       if [ "$pv" = "0" ]; then plat_ok=1; break; fi
+      # v1.17：不可判（skip，pv=2）傻等 60 秒无意义——no-token/no-sn/网络不可达不会随重试变好
+      [ "$pv" = "2" ] && { pmsg2="${pmsg2}(不可判)"; break; }
     done
   fi
   if [ "$ok" = "1" ] && [ "$plat_ok" = "1" ]; then
@@ -501,7 +521,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.16 =="
+  echo "== zopguard 自检 v1.17 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -516,7 +536,7 @@ selftest() {
   echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.16 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.17 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
@@ -531,12 +551,14 @@ LOCK="$DIR/.lock"
 if ! mkdir "$LOCK" 2>/dev/null; then
   # 已存在：并发运行则直接退出；陈旧锁（>30 分钟残留；修复最坏路径约 22 分钟）清理后重试一次
   if [ -n "$(find "$LOCK" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
-    rmdir "$LOCK" 2>/dev/null
+    rm -rf "$LOCK" 2>/dev/null
     mkdir "$LOCK" 2>/dev/null || exit 0
   else
     exit 0
   fi
 fi
-trap 'rmdir "$LOCK" 2>/dev/null' EXIT
+# v1.17：锁内写 pid 文件——EXIT trap 只删自己创建的锁（防睡眠>30min 后旧实例醒来误删新实例锁 → 双实例风暴）
+echo "$$" > "$LOCK/pid" 2>/dev/null
+trap 'if [ -f "$LOCK/pid" ] && [ "$(cat "$LOCK/pid" 2>/dev/null)" = "$$" ]; then rm -f "$LOCK/pid"; rmdir "$LOCK" 2>/dev/null; fi' EXIT
 
 check_and_repair
