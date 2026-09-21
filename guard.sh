@@ -1,6 +1,6 @@
 #!/bin/bash
-# zopguard —— ZopToken 自愈守护 v1.17（通用版）
-# zopguard-version: 1.17
+# zopguard —— ZopToken 自愈守护 v1.18（通用版）
+# zopguard-version: 1.18
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -394,6 +394,8 @@ check_and_repair() {
   local now last cnt today cd_date noted reason="" pmsg pv maxt
   # v1.7 授权校验（客户机：到期自动自毁退出；自用机无 license 正常放行）
   check_license >/dev/null 2>&1 || return 1
+  # v1.18：机器永不睡——每轮确保 caffeinate 全防在跑（-d 显示器 -i 空闲 -m 磁盘 -u 用户活跃 -s 系统睡眠；免 sudo；重启后自动恢复）
+  pgrep -x caffeinate >/dev/null 2>&1 || { nohup caffeinate -diumsu >/dev/null 2>&1 & }
   # v1.17：自更新与远程命令无条件执行（旧逻辑只在健康分支跑——坏机器永远收不到新版和一键重启）
   auto_update
   check_remote_cmd
@@ -449,6 +451,19 @@ check_and_repair() {
   fi
 
   # ③ 修复：API 直登（恢复槽位）→ 退出→重开 → 轮询平台 healthy → 汇报
+  # v1.18：3 天整机重启——距上次整机重启 ≥3 天时，借本次掉线窗口直接重启整机
+  # （防长时间开机客户端软件失灵；3 天内只触发一次；重启后 launchd 自动拉起一切）
+  local rb_ts rb_days
+  rb_ts=$(sget LAST_REBOOT_TS); rb_ts=${rb_ts:-0}
+  rb_days=$(( (now - rb_ts) / 86400 ))
+  if [ "$rb_days" -ge 3 ] && [ "$(sget REBOOT_NOTED)" != "$today" ]; then
+    log "3天整机重启：距上次整机重启 $rb_days 天，借本次掉线窗口执行"
+    sput LAST_REBOOT_TS "$now"
+    sput REBOOT_NOTED "$today"
+    notify "🔁 [$MACHINE_NAME] 已连续运行 $rb_days 天，借本次掉线窗口自动整机重启（防长时间开机失灵），约 1 分钟后重启。"
+    ( trap - EXIT; sleep 60; sudo -n shutdown -r now 2>/dev/null || osascript -e 'tell app "System Events" to restart' 2>/dev/null ) &
+    exit 0
+  fi
   local t0; t0=$(date '+%F %T')
   log "repair: $reason，执行 API直登+退出→重开（app=$APP_PATH）"
   # v1.4：先恢复平台槽位（配了登录 Key 才做），客户端重开后才会静默重连
@@ -521,7 +536,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.17 =="
+  echo "== zopguard 自检 v1.18 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -536,7 +551,7 @@ selftest() {
   echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.17 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.18 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
