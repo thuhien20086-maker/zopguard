@@ -1,6 +1,6 @@
 #!/bin/bash
 # zopguard —— ZopToken 自愈守护 v1.18（通用版）
-# zopguard-version: 1.19
+# zopguard-version: 1.20
 # 每 3 分钟由 launchd 调用：
 #   · 检测 ZopToken 进程，异常时自动「退出→重开」
 #   · v1.2 平台判据：进程活着但平台侧状态异常（假活/掉线）也会自动修复
@@ -516,21 +516,30 @@ check_and_repair() {
     done
   fi
   if [ "$ok" = "1" ] && [ "$plat_ok" = "1" ]; then
+    sput LOGIN_FAIL_CNT 0
     notify "✅ [$MACHINE_NAME] $t0 检测到 ZopToken 异常（$reason），已自动恢复：平台槽位重新挂载 + 客户端重启，当前平台 healthy、进程运行中。"
     log "repair ok（平台 healthy，$t0）"
     echo "REPAIRED_OK"
-  elif [ "$ok" = "1" ]; then
+  else
+    # v1.20 分级自愈：先重启软件（每轮已做），连续 6 轮（约18分钟）无效 → 整机重启（每天最多 1 次）
+    local fcnt; fcnt=$(sget LOGIN_FAIL_CNT); fcnt=$(( ${fcnt:-0} + 1 )); sput LOGIN_FAIL_CNT "$fcnt"
+    if [ "$fcnt" -ge 6 ] && [ "$(sget REBOOT_NOTED)" != "$today" ]; then
+      sput REBOOT_NOTED "$today"
+      sput LOGIN_FAIL_CNT 0
+      notify "🔁 [$MACHINE_NAME] 客户端反复修复失败（连续 $fcnt 轮），启动设备级恢复：约 30 秒后整机重启，重启后自动上线。"
+      log "reboot: 连续 $fcnt 轮修复失败 → 整机重启"
+      ( trap - EXIT; sleep 30; sudo -n shutdown -r now 2>/dev/null || osascript -e 'tell app "System Events" to restart' 2>/dev/null ) &
+      exit 0
+    fi
     if [ "$relogin_rc" = "0" ]; then
       notify "⚠️ [$MACHINE_NAME] $t0 ZopToken 异常（$reason）：槽位已恢复、客户端已重启，但平台侧 60 秒内未确认 healthy（$pmsg2），下轮自动复查。"
-    else
+    elif [ "$ok" = "1" ]; then
       notify "⚠️ [$MACHINE_NAME] $t0 ZopToken 异常（$reason）：客户端已重启，但 API 直登失败（可能登录密钥失效或平台异常），下轮自动复查，如仍异常请人工看看。"
+    else
+      notify "⚠️ [$MACHINE_NAME] $t0 ZopToken 异常（$reason）已自动重启，60 秒内未确认进程恢复（可能启动慢或异常），下轮自动复查，如仍异常请人工看看。"
     fi
     log "repair half（$t0，$pmsg2）"
     echo "REPAIRED_HALF"
-  else
-    notify "⚠️ [$MACHINE_NAME] $t0 ZopToken 异常（$reason）已自动重启，60 秒内未确认进程恢复（可能启动慢或异常），下轮自动复查，如仍异常请人工看看。"
-    log "repair failed（$t0）"
-    echo "REPAIRED_FAIL"
   fi
   sput LAST_REPAIR "$now"
   cnt=$((cnt + 1)); sput COUNT "$cnt"
@@ -538,7 +547,7 @@ check_and_repair() {
 
 # ---------- 自检（部署时跑一次） ----------
 selftest() {
-  echo "== zopguard 自检 v1.19 =="
+  echo "== zopguard 自检 v1.20 =="
   echo "机器名: $MACHINE_NAME"
   echo "每日修复上限: $DAILY_MAX 次 / 冷却 ${COOLDOWN_SEC}s"
   if pgrep -x "$APP" >/dev/null 2>&1; then
@@ -553,7 +562,7 @@ selftest() {
   echo "授权: $([ -f "$LIC" ] && echo "客户机（$(check_license)）" || echo "自用版（无限期）")"
   echo "launchd: $(launchctl list 2>/dev/null | grep -qi zopguard && echo '已加载 ✓' || echo '未加载')"
   echo "日志: $LOG"
-  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.19 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
+  notify "🟢 [$MACHINE_NAME] zopguard 自愈守护 v1.20 已部署：进程掉线/平台假活自动「退出重开」，登录态掉线自动「API 直登恢复」，版本升级自动「自更新」，全过程汇报到本渠道。"
   echo "（自检消息已发送，请确认收到）"
 }
 
